@@ -1,0 +1,210 @@
+name: Performance Tests
+
+on:
+  schedule:
+    # Ejecutar diariamente a las 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # Permitir ejecución manual
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'src/**'
+      - 'proxy/**'
+      - 'infra/**'
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  performance:
+    name: Performance & Load Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements-dev.txt
+      
+      - name: Setup Docker
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Construir imagen
+        run: |
+          make build
+      
+      - name: Desplegar stack con Docker Compose
+        run: |
+          # Crear docker-compose.yml temporal para testing
+          cat > docker-compose.yml <<EOF
+          version: '3.8'
+          services:
+            backend:
+              image: edge-cache-backend:latest
+              ports:
+                - "8080:8080"
+              environment:
+                - BACKEND_PORT=8080
+                - FLASK_DEBUG=false
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+                interval: 10s
+                timeout: 5s
+                retries: 3
+            
+            proxy:
+              image: nginx:alpine
+              ports:
+                - "80:80"
+              volumes:
+                - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+              depends_on:
+                backend:
+                  condition: service_healthy
+          EOF
+          
+          docker-compose up -d
+          sleep 10  # Esperar a que los servicios estén listos
+      
+      - name: Verificar servicios
+        run: |
+          curl -f http://localhost/health || exit 1
+          curl -f http://localhost/api/static || exit 1
+      
+      - name: Ejecutar tests de carga básicos
+        run: |
+          # Generar tráfico de prueba
+          echo "Generando tráfico de prueba..."
+          
+          for i in {1..100}; do
+            curl -s http://localhost/api/static > /dev/null &
+            curl -s http://localhost/api/dynamic > /dev/null &
+            curl -s http://localhost/api/data?page=1 > /dev/null &
+          done
+          
+          wait
+          echo "✓ Tráfico generado"
+      
+      - name: Recolectar métricas
+        run: |
+          # Esperar a que se escriban los logs
+          sleep 5
+          
+          # Copiar logs del contenedor
+          docker cp $(docker ps -qf "name=proxy"):/var/log/nginx/access.log ./access.log
+          
+          # Analizar métricas
+          python scripts/analyze_logs.py ./access.log --format json > metrics.json
+          
+          # Mostrar resumen
+          python scripts/analyze_logs.py ./access.log --format summary
+      
+      - name: Verificar Hit Ratio
+        run: |
+          # Extraer hit ratio del JSON
+          HIT_RATIO=$(python -c "import json; data=json.load(open('metrics.json')); print(data['metrics']['hit_ratio'])")
+          
+          echo "Hit Ratio: $HIT_RATIO"
+          
+          # Verificar que sea >= 0.5 (50%) al menos
+          if (( $(echo "$HIT_RATIO < 0.5" | bc -l) )); then
+            echo "❌ Hit ratio muy bajo: $HIT_RATIO"
+            exit 1
+          fi
+          
+          echo "✓ Hit ratio aceptable: $HIT_RATIO"
+      
+      - name: Verificar Latencia P95
+        run: |
+          # Extraer P95 del JSON
+          P95=$(python -c "import json; data=json.load(open('metrics.json')); print(data['metrics']['p95_latency_ms'])")
+          
+          echo "P95 Latency: ${P95}ms"
+          
+          # Verificar que sea < 500ms
+          if (( $(echo "$P95 > 500" | bc -l) )); then
+            echo "⚠️  P95 latency alta: ${P95}ms"
+            # No falla el build, solo warning
+          else
+            echo "✓ P95 latency aceptable: ${P95}ms"
+          fi
+      
+      - name: Generar reporte de performance
+        run: |
+          python scripts/generate_report.py metrics.json > performance_report.md
+      
+      - name: Upload métricas
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-metrics
+          path: |
+            metrics.json
+            performance_report.md
+            access.log
+      
+      - name: Comentar en PR (si aplica)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('performance_report.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 📊 Performance Report\n\n${report}`
+            });
+      
+      - name: Cleanup
+        if: always()
+        run: |
+          docker-compose down -v
+          docker system prune -f
+  
+  stress-test:
+    name: Stress Test (opcional)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+      
+      - name: Setup
+        run: |
+          make build
+          make apply
+      
+      - name: Instalar herramientas de carga
+        run: |
+          # Apache Bench para tests de carga
+          sudo apt-get update
+          sudo apt-get install -y apache2-utils
+      
+      - name: Stress test con ab
+        run: |
+          # 1000 requests, 10 concurrentes
+          ab -n 1000 -c 10 http://localhost/api/static > ab_results.txt
+          
+          cat ab_results.txt
+      
+      - name: Upload resultados
+        uses: actions/upload-artifact@v3
+        with:
+          name: stress-test-results
+          path: ab_results.txt
+      
+      - name: Cleanup
+        if: always()
+        run: make destroy

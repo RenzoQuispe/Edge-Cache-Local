@@ -1,0 +1,8 @@
+# Dependencias de producción
+flask==3.0.0
+werkzeug==3.0.1
+python-dotenv==1.0.0
+requests==2.32.3 
+# Para producción (opcional)
+gunicorn==21.2.0
+gevent>=24.0.0
